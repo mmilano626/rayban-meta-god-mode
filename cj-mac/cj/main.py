@@ -12,12 +12,13 @@ from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocke
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, model_validator
 
-from . import access, coder, prefs, beacon, live, recall, notes, nudges, phone_agent, lookups, tts
+from . import access, coder, prefs, beacon, live, live_local, local_mode, recall, notes, nudges, phone_agent, lookups, stt, tts
 from .access import Access
 from .events import bus
 from .llm.provider import Attachment
 from .llm import spend
 from .llm.chain import router
+from .local_mode import LocalVoiceError
 from .modes import assistant
 from .modes.common import ask_json
 
@@ -78,7 +79,8 @@ class AskIn(BaseModel):
 
 @app.get("/health")
 async def health():
-    return {"name": "CJ", "ok": True, "providers": router.status(), "spend": spend.status()}
+    return {"name": "CJ", "ok": True, "providers": router.status(), "spend": spend.status(),
+            "local": local_mode.status()}
 
 
 @app.post("/api/ask", dependencies=[Depends(require_auth)])
@@ -89,6 +91,8 @@ async def ask(body: AskIn):
     access.SETTINGS.set(body.access.model_dump() if body.access else None)
     phone_agent.remember_apps(body.apps)
     try:
+        if local_mode.enabled() and body.image_b64:
+            raise LocalVoiceError("vision is not supported in local-only mode")
         if body.audio_b64 and not body.text.strip():
             out = await assistant.ask_spoken(Attachment(body.audio_b64, body.audio_mime), history)
             bus.emit("heard", mode=body.mode, text=out["heard"] or "(no clear speech)", has_image=False, spoken=True)
@@ -96,13 +100,21 @@ async def ask(body: AskIn):
             bus.emit("heard", mode=body.mode, text=body.text, has_image=bool(body.image_b64))
             image = Attachment(body.image_b64, body.mime) if body.image_b64 else None
             out = await assistant.ask(body.text, history, image)
+    except LocalVoiceError as e:
+        bus.emit("error", where="ask", error=str(e)[:200])
+        raise HTTPException(503, str(e)[:300]) from e
     except Exception as e:
         bus.emit("error", where="ask", error=str(e)[:200])
         raise HTTPException(502, f"no AI provider could answer: {e}"[:300]) from e
     if body.voice and out["spoken"]:
-        audio = await tts.speak(out["spoken"], out.get("language"))
+        try:
+            audio = await tts.speak(out["spoken"], out.get("language"))
+        except LocalVoiceError as e:
+            raise HTTPException(503, str(e)[:300]) from e
         if audio:
             out["voice_b64"] = base64.b64encode(audio).decode()
+        elif local_mode.enabled():
+            raise HTTPException(503, "local TTS returned no audio")
     out["ms"] = int((time.monotonic() - started) * 1000)
     if out["needs_photo"]:
         bus.emit("needs_photo", mode=body.mode, text=out["heard"], ms=out["ms"])
@@ -122,6 +134,9 @@ async def notes_dictate(body: DictateIn):
     """One chunk of "start taking notes". When the user says "stop taking notes", the reply has the summary."""
     try:
         out = await assistant.dictate(Attachment(body.audio_b64, body.audio_mime), body.session)
+    except LocalVoiceError as e:
+        bus.emit("error", where="dictate", error=str(e)[:200])
+        raise HTTPException(503, str(e)[:300]) from e
     except Exception as e:
         bus.emit("error", where="dictate", error=str(e)[:200])
         raise HTTPException(502, f"couldn't transcribe: {e}"[:300]) from e
@@ -150,7 +165,10 @@ _last_glance = ""
 async def glance(body: GlanceIn):
     """Visual memory (opt-in): one automatic photo. Only a short note is kept; the photo itself is not stored."""
     global _last_glance
-    note = await assistant.glance(Attachment(body.image_b64, body.mime), _last_glance)
+    try:
+        note = await assistant.glance(Attachment(body.image_b64, body.mime), _last_glance)
+    except LocalVoiceError as e:
+        raise HTTPException(503, str(e)[:300]) from e
     if note:
         _last_glance = note
         bus.emit("glance", note=note)
@@ -165,9 +183,15 @@ class HearIn(BaseModel):
 @app.post("/api/hear", dependencies=[Depends(require_auth)])
 async def hear(body: HearIn):
     """Just what was said (no answer): the phone agent's "should I?" questions."""
-    data, _ = await ask_json("transcribe", assistant.TRANSCRIBE, [{"role": "user", "text": "(audio)"}],
-                             Attachment(body.audio_b64, body.audio_mime))
-    return {"heard": str(data.get("heard", "")).strip()}
+    try:
+        if local_mode.enabled():
+            heard = await stt.transcribe(Attachment(body.audio_b64, body.audio_mime))
+            return {"heard": heard.strip()}
+        data, _ = await ask_json("transcribe", assistant.TRANSCRIBE, [{"role": "user", "text": "(audio)"}],
+                                 Attachment(body.audio_b64, body.audio_mime))
+        return {"heard": str(data.get("heard", "")).strip()}
+    except LocalVoiceError as e:
+        raise HTTPException(503, str(e)[:300]) from e
 
 
 class AgentStepIn(BaseModel):
@@ -212,7 +236,12 @@ class SpeakIn(BaseModel):
 @app.post("/api/speak", dependencies=[Depends(require_auth)])
 async def speak(body: SpeakIn):
     """CJ's voice for things the phone says on its own, like a timer going off."""
-    audio = await tts.speak(body.text)
+    try:
+        audio = await tts.speak(body.text)
+    except LocalVoiceError as e:
+        raise HTTPException(503, str(e)[:300]) from e
+    if local_mode.enabled() and not audio:
+        raise HTTPException(503, "local TTS returned no audio")
     return {"voice_b64": base64.b64encode(audio).decode() if audio else ""}
 
 
@@ -250,15 +279,18 @@ async def console():
 
 @app.websocket("/ws/live")
 async def ws_live(ws: WebSocket, token: str = ""):
-    """Real-time conversation (and live translation) with Gemini Live; see live.py. The phone sends its pairing
-    token as a header, so it doesn't show up in the server's request log."""
+    """Real-time conversation. Default: Gemini Live (live.py). Strict local-only: STT→chat→TTS (live_local.py).
+    The phone sends its pairing token as a header, so it doesn't show up in the server's request log."""
     token = ws.headers.get("authorization", "").removeprefix("Bearer ").strip() or token
     if not _valid(token):
         await ws.close(code=4401)
         return
     await ws.accept()
     try:
-        await live.Bridge(ws).run()
+        if local_mode.enabled():
+            await live_local.LocalBridge(ws).run()
+        else:
+            await live.Bridge(ws).run()
     except WebSocketDisconnect:
         pass
     finally:

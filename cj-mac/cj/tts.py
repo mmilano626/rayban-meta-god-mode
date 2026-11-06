@@ -1,24 +1,26 @@
-"""CJ's voice: Microsoft Azure Speech (Olivia by default; pick another with tools/azure_voice_samples.py).
+"""CJ's voice.
 
-Each reply is spoken by a native voice for its language. The model reports the reply's language (an ISO 639-1
-code like "es", or "hinglish"); when it doesn't, the script of the text decides, and anything else goes to a
-multilingual voice. Needs the "azure_speech" key and "azure_region" in ~/.cj/config.json. Without them, or when
-Azure fails, the phone falls back to its own text-to-speech.
+Default: Microsoft Azure Speech (Olivia by default; pick another with tools/azure_voice_samples.py).
+Strict local-only mode (CJ_LOCAL_ONLY): OpenAI-compatible local TTS (Kokoro-style /v1/audio/speech).
+No cloud fallback when local-only is on; failures raise LocalVoiceError.
 """
 from __future__ import annotations
 
+import io
 import os
 import re
+import struct
+import wave
 from xml.sax.saxutils import escape
 
 import httpx
 
-from . import prefs
+from . import local_mode, prefs
+from .local_mode import LocalVoiceError
 
-VOICE = os.environ.get("CJ_VOICE", "en-US-Olivia:MAI-Voice-2.1-Flash")  # natural and expressive; set CJ_VOICE to change it
-MULTILINGUAL = "en-US-AvaMultilingualNeural"  # speaks most languages; used when there's no native voice below
+VOICE = os.environ.get("CJ_VOICE", "en-US-Olivia:MAI-Voice-2.1-Flash")
+MULTILINGUAL = "en-US-AvaMultilingualNeural"
 
-# Language code -> (Azure voice, SSML locale). All female, natural ("Neural") voices.
 VOICES = {
     "en": (VOICE, "en-US"), "hinglish": (VOICE, "en-US"),
     "hi": (os.environ.get("CJ_VOICE_HINDI", "hi-IN-SwaraNeural"), "hi-IN"),
@@ -30,19 +32,19 @@ VOICES = {
     "te": ("te-IN-ShrutiNeural", "te-IN"), "mr": ("mr-IN-AarohiNeural", "mr-IN"), "gu": ("gu-IN-DhwaniNeural", "gu-IN"),
 }
 
-# When the model gives no language: the writing system is a strong hint.
-SCRIPTS = [(r"[ऀ-ॿ]", "hi"), (r"[一-鿿]", "zh"), (r"[぀-ヿ]", "ja"), (r"[가-힯]", "ko"),
+SCRIPTS = [(r"[ऀ-ॿ]", "hi"), (r"[一-鿿]", "zh"), (r"[ぁ-ヿ]", "ja"), (r"[가-힯]", "ko"),
            (r"[؀-ۿ]", "ar"), (r"[ঀ-৿]", "bn"), (r"[Ѐ-ӿ]", "ru"), (r"[஀-௿]", "ta"),
            (r"[ఀ-౿]", "te"), (r"[઀-૿]", "gu")]
 
+OWN_SCRIPT = {"hi", "zh", "ar", "bn", "ru", "ur", "ja", "ko", "ta", "te", "mr", "gu"}
+
+OUT_RATE = 24000  # phone LiveSession expects 24 kHz PCM
+
 
 def available() -> bool:
+    if local_mode.enabled():
+        return True  # reachability is checked at speak time; config alone is enough to attempt
     return bool(prefs.key("azure_speech") and prefs.load().get("azure_region"))
-
-
-# Languages written in their own script. Labelled with one of these but written in Roman letters, the reply is
-# Hinglish-style ("Mumbai mein baarish ho rahi hai"), which a Hindi or Japanese voice reads badly.
-OWN_SCRIPT = {"hi", "zh", "ar", "bn", "ru", "ur", "ja", "ko", "ta", "te", "mr", "gu"}
 
 
 def voice_for(text: str, language: str | None = None) -> tuple[str, str]:
@@ -57,9 +59,71 @@ def voice_for(text: str, language: str | None = None) -> tuple[str, str]:
     return VOICES["en"] if text.isascii() else (MULTILINGUAL, "en-US")
 
 
+def wav_to_pcm24(data: bytes) -> bytes:
+    """Extract little-endian 16-bit mono PCM from a WAV; resample is not done — caller must match 24 kHz."""
+    with wave.open(io.BytesIO(data), "rb") as w:
+        if w.getsampwidth() != 2 or w.getnchannels() not in (1, 2):
+            raise LocalVoiceError("local TTS WAV must be 16-bit mono or stereo")
+        frames = w.readframes(w.getnframes())
+        rate = w.getframerate()
+        if w.getnchannels() == 2:
+            # downmix
+            samples = memoryview(frames).cast("h")
+            mono = struct.pack(f"<{len(samples) // 2}h",
+                               *(((samples[i] + samples[i + 1]) // 2) for i in range(0, len(samples), 2)))
+            frames = mono
+        if rate != OUT_RATE:
+            # Honest limitation: we only accept 24 kHz from local TTS (Kokoro default).
+            raise LocalVoiceError(f"local TTS sample rate {rate} Hz; need {OUT_RATE} Hz")
+        return frames
+
+
 async def speak(text: str, language: str | None = None) -> bytes | None:
-    """24 kHz 16-bit mono WAV of [text], or None if Azure isn't set up or fails."""
-    if not text.strip() or not available():
+    """24 kHz 16-bit mono WAV of [text].
+
+    Local-only: returns WAV bytes or raises LocalVoiceError (never Azure, never silent None).
+    Cloud mode: Azure WAV, or None if unset/failed (phone falls back to its own TTS).
+    """
+    if not text.strip():
+        return None if not local_mode.enabled() else b""
+    if local_mode.enabled():
+        return await _local_speak(text)
+    return await _azure_speak(text, language)
+
+
+async def speak_pcm(text: str, language: str | None = None) -> bytes:
+    """Raw 24 kHz PCM for the live WebSocket. Local-only only."""
+    wav = await speak(text, language)
+    if not wav:
+        return b""
+    if wav[:4] == b"RIFF":
+        return wav_to_pcm24(wav)
+    return wav  # already PCM if the server was asked for pcm
+
+
+async def _local_speak(text: str) -> bytes:
+    url = local_mode.tts_base() + "/v1/audio/speech"
+    body = {
+        "input": text[:4000],  # preserve wording; only bound length for safety
+        "model": local_mode.tts_model(),
+        "voice": local_mode.tts_voice(),
+        "response_format": "wav",
+        "speed": 1,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=local_mode.timeout()) as client:
+            r = await client.post(url, json=body)
+    except httpx.HTTPError as e:
+        raise LocalVoiceError(f"local TTS unreachable: {type(e).__name__}: {e}") from e
+    if r.status_code != 200:
+        raise LocalVoiceError(f"local TTS {r.status_code}: {r.text[:200]}")
+    if not r.content:
+        raise LocalVoiceError("local TTS returned empty audio")
+    return r.content
+
+
+async def _azure_speak(text: str, language: str | None) -> bytes | None:
+    if not available():
         return None
     voice, lang = voice_for(text, language)
     ssml = (f'<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="{lang}">'
