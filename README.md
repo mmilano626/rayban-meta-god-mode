@@ -430,6 +430,9 @@ after step 3. It reads back exactly what it is about to do and waits for you to 
 | `CJ_DEEPSEEK_MODEL` | `deepseek-chat` | DeepSeek model |
 | `CJ_OPENROUTER_MODEL` | | OpenRouter model, e.g. one ending in `:free` |
 | `CJ_OLLAMA_MODEL`, `CJ_OLLAMA_URL` | , `http://localhost:11434` | Local Ollama model and server |
+| `CJ_LOCAL_ONLY` | off | Strict local voice: STT→local chat→TTS; see [docs/local-only-voice.md](docs/local-only-voice.md) |
+| `CJ_STT_URL`, `CJ_TTS_URL` | `http://127.0.0.1:8178`, `…8179` | Local OpenAI-compatible STT/TTS roots when `CJ_LOCAL_ONLY` is on |
+| `CJ_TTS_VOICE`, `CJ_TTS_MODEL` | `af_heart`, `kokoro` | Local TTS voice/model |
 | `CJ_VOICE` | `en-US-Olivia:MAI-Voice-2.1-Flash` | Azure voice; compare with `tools/azure_voice_samples.py` |
 | `CJ_LIVE_MODEL` | `gemini-3.1-flash-live-preview` | Model for real-time conversation and translation |
 | `CJ_LIVE_VOICE` | `Sulafat` | Gemini Live voice |
